@@ -16,7 +16,6 @@ import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.common.MetadataClient;
-import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigResolver;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
@@ -191,6 +190,9 @@ public class LoadMonitor {
     double metadataFactorExponent = config.getDouble(MonitorConfig.METADATA_FACTOR_EXPONENT_CONFIG);
     dropwizardMetricRegistry.register(MetricRegistry.name(LOAD_MONITOR_METRICS_NAME_PREFIX, "metadata-factor"),
                                       (Gauge<Double>) () -> metadataFactor(metadataFactorExponent));
+    // The cluster has partitions with ISR > replicas (0: No such partitions, 1: Has such partitions)
+    dropwizardMetricRegistry.register(MetricRegistry.name(LOAD_MONITOR_METRICS_NAME_PREFIX, "has-partitions-with-isr-greater-than-replicas"),
+                                      (Gauge<Integer>) () -> MonitorUtils.hasPartitionsWithIsrGreaterThanReplicas(kafkaCluster()) ? 1 : 0);
   }
 
   /**
@@ -464,7 +466,7 @@ public class LoadMonitor {
    * @return Cluster capacity without cluster load.
    */
   public ClusterModel clusterCapacity() throws TimeoutException, BrokerCapacityResolutionException {
-    MetadataClient.ClusterAndGeneration clusterAndGeneration = _metadataClient.refreshMetadata();
+    MetadataClient.ClusterAndGeneration clusterAndGeneration = refreshClusterAndGeneration();
     Cluster cluster = clusterAndGeneration.cluster();
 
     // Create an empty cluster model first.
@@ -504,8 +506,12 @@ public class LoadMonitor {
       try {
         brokerCapacity = _brokerCapacityConfigResolver.capacityForBroker(rack, node.host(), node.id(), BROKER_CAPACITY_FETCH_TIMEOUT_MS,
                                                                          allowCapacityEstimation);
-        LOG.debug("Get capacity info for broker {}: total capacity {}, capacity by logdir {}.", node.id(),
-                  brokerCapacity.capacity().get(Resource.DISK), brokerCapacity.diskCapacityByLogDir());
+        LOG.debug("Capacity of broker {}: {}, (LogDir: {}, Cores: {}).", node.id(), brokerCapacity.capacity(),
+                  brokerCapacity.diskCapacityByLogDir(), brokerCapacity.numCpuCores());
+        if (populateReplicaPlacementInfo && brokerCapacity.diskCapacityByLogDir() == null) {
+          throw new IllegalStateException(String.format("Missing disk capacity information for logDirs on broker %d. "
+                                                        + "Are you trying to use a JBOD feature on a non-JBOD Kafka deployment?", node.id()));
+        }
       } catch (TimeoutException | BrokerCapacityResolutionException e) {
         String errorMessage = String.format("Unable to retrieve capacity for broker %d. This may be caused by churn in "
                                             + "the cluster, please retry.", node.id());
@@ -539,7 +545,7 @@ public class LoadMonitor {
       throws NotEnoughValidWindowsException, TimeoutException, BrokerCapacityResolutionException {
     long startMs = _time.milliseconds();
 
-    MetadataClient.ClusterAndGeneration clusterAndGeneration = _metadataClient.refreshMetadata();
+    MetadataClient.ClusterAndGeneration clusterAndGeneration = refreshClusterAndGeneration();
     Cluster cluster = clusterAndGeneration.cluster();
 
     // Get the metric aggregation result.
@@ -589,7 +595,7 @@ public class LoadMonitor {
    * expensive.
    */
   public ModelGeneration clusterModelGeneration() {
-    int clusterGeneration = _metadataClient.refreshMetadata().generation();
+    int clusterGeneration = refreshClusterAndGeneration().generation();
     return new ModelGeneration(clusterGeneration, _partitionMetricSampleAggregator.generation());
   }
 
@@ -601,7 +607,7 @@ public class LoadMonitor {
     if (_cachedBrokerLoadGeneration != null
         && (allowCapacityEstimation || !_cachedBrokerLoadStats.isBrokerStatsEstimated())
         && _partitionMetricSampleAggregator.generation() == _cachedBrokerLoadGeneration.loadGeneration()
-        && _metadataClient.refreshMetadata().generation() == _cachedBrokerLoadGeneration.clusterGeneration()) {
+        && refreshClusterAndGeneration().generation() == _cachedBrokerLoadGeneration.clusterGeneration()) {
       return _cachedBrokerLoadStats;
     }
     return null;
@@ -641,7 +647,7 @@ public class LoadMonitor {
    * @return True if the monitored load meets the load requirements, false otherwise.
    */
   public boolean meetCompletenessRequirements(ModelCompletenessRequirements requirements) {
-    MetadataClient.ClusterAndGeneration clusterAndGeneration = _metadataClient.refreshMetadata();
+    MetadataClient.ClusterAndGeneration clusterAndGeneration = refreshClusterAndGeneration();
     return meetCompletenessRequirements(clusterAndGeneration.cluster(), requirements);
   }
 
@@ -676,7 +682,7 @@ public class LoadMonitor {
   }
 
   /**
-   * Get all the brokers having offline replca in the cluster based on the partition assignment. If a metadata refresh failed
+   * Get all the brokers having offline replicas in the cluster based on the partition assignment. If a metadata refresh failed
    * due to timeout, the current metadata information will be used. This is to handle the case that all the brokers are down.
    * @param timeout the timeout in milliseconds.
    * @return All the brokers in the cluster that has at least one offline replica.
@@ -733,7 +739,7 @@ public class LoadMonitor {
   }
 
   private double getMonitoredPartitionsPercentage() {
-    MetadataClient.ClusterAndGeneration clusterAndGeneration = _metadataClient.refreshMetadata();
+    MetadataClient.ClusterAndGeneration clusterAndGeneration = refreshClusterAndGeneration();
 
     Cluster kafkaCluster = clusterAndGeneration.cluster();
     MetricSampleAggregationResult<String, PartitionEntity> metricSampleAggregationResult;
@@ -795,7 +801,7 @@ public class LoadMonitor {
     private int _refreshCount = 0;
     @Override
     public void run() {
-      _allTopics.addAll(_metadataClient.refreshMetadata().cluster().topics());
+      _allTopics.addAll(refreshClusterAndGeneration().cluster().topics());
       _refreshCount++;
       if (_refreshCount % REFRESH_LIMIT == 0) {
         _partitionMetricSampleAggregator.retainEntityGroup(_allTopics);

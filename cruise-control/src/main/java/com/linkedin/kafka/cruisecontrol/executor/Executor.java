@@ -7,6 +7,7 @@ package com.linkedin.kafka.cruisecontrol.executor;
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.MetricRegistry;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils;
+import com.linkedin.kafka.cruisecontrol.common.TopicMinIsrCache;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.common.MetadataClient;
@@ -17,6 +18,7 @@ import com.linkedin.kafka.cruisecontrol.executor.strategy.ReplicaMovementStrateg
 import com.linkedin.kafka.cruisecontrol.model.ReplicaPlacementInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
 import com.linkedin.kafka.cruisecontrol.servlet.UserTaskManager;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -28,6 +30,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -38,9 +41,11 @@ import kafka.zk.KafkaZkClient;
 import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AlterPartitionReassignmentsResult;
+import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.internals.ClusterResourceListeners;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
@@ -92,6 +97,8 @@ public class Executor {
   private final AtomicInteger _stopSignal;
   private final Time _time;
   private volatile boolean _hasOngoingExecution;
+  private final Semaphore _flipOngoingExecutionMutex;
+  private final Semaphore _noOngoingExecutionSemaphore;
   private volatile ExecutorState _executorState;
   private volatile String _uuid;
   private volatile Supplier<String> _reasonSupplier;
@@ -116,6 +123,8 @@ public class Executor {
   private final ConcurrencyAdjuster _concurrencyAdjuster;
   private final ScheduledExecutorService _concurrencyAdjusterExecutor;
   private final ConcurrentMap<ConcurrencyType, Boolean> _concurrencyAdjusterEnabled;
+  private volatile boolean _concurrencyAdjusterMinIsrCheckEnabled;
+  private final TopicMinIsrCache _topicMinIsrCache;
   private final long _minExecutionProgressCheckIntervalMs;
   public final long _slowTaskAlertingBackoffTimeMs;
   private final KafkaCruiseControlConfig _config;
@@ -182,6 +191,8 @@ public class Executor {
     _executorState = ExecutorState.noTaskInProgress(recentlyDemotedBrokers(), recentlyRemovedBrokers());
     _stopSignal = new AtomicInteger(NO_STOP_EXECUTION);
     _hasOngoingExecution = false;
+    _flipOngoingExecutionMutex = new Semaphore(1);
+    _noOngoingExecutionSemaphore = new Semaphore(1);
     _uuid = null;
     _reasonSupplier = null;
     _executorNotifier = executorNotifier != null ? executorNotifier
@@ -205,10 +216,17 @@ public class Executor {
                                     allEnabled || config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_LEADERSHIP_ENABLED_CONFIG));
     // Support for intra-broker replica movement is pending https://github.com/linkedin/cruise-control/issues/1299.
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTRA_BROKER_REPLICA, false);
+    _concurrencyAdjusterMinIsrCheckEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG);
     _concurrencyAdjusterExecutor = Executors.newSingleThreadScheduledExecutor(
         new KafkaCruiseControlThreadFactory(ConcurrencyAdjuster.class.getSimpleName()));
-    long intervalMs = config.getLong(ExecutorConfig.CONCURRENCY_ADJUSTER_INTERVAL_MS_CONFIG);
-    _concurrencyAdjuster = new ConcurrencyAdjuster();
+    int numMinIsrCheck = config.getInt(ExecutorConfig.CONCURRENCY_ADJUSTER_NUM_MIN_ISR_CHECK_CONFIG);
+    long intervalMs = config.getLong(ExecutorConfig.CONCURRENCY_ADJUSTER_INTERVAL_MS_CONFIG) / numMinIsrCheck;
+    _concurrencyAdjuster = new ConcurrencyAdjuster(numMinIsrCheck);
+    _topicMinIsrCache = new TopicMinIsrCache(Duration.ofMillis(config.getLong(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_ISR_RETENTION_MS_CONFIG)),
+                                             config.getInt(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_ISR_CACHE_SIZE_CONFIG),
+                                             ExecutionUtils.MIN_ISR_CACHE_CLEANER_PERIOD,
+                                             ExecutionUtils.MIN_ISR_CACHE_CLEANER_INITIAL_DELAY,
+                                             _time);
     _concurrencyAdjusterExecutor.scheduleAtFixedRate(_concurrencyAdjuster, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
     _executionHistoryScannerExecutor = Executors.newSingleThreadScheduledExecutor(
         new KafkaCruiseControlThreadFactory(ExecutionHistoryScanner.class.getSimpleName()));
@@ -305,15 +323,23 @@ public class Executor {
   }
 
   /**
-   * A runnable class to auto-adjust the allowed reassignment concurrency for ongoing executions
-   * using selected broker metrics and based on additive-increase/multiplicative-decrease (AIMD) feedback control algorithm.
-   * Skips concurrency adjustment for demote operations.
+   * A runnable class to auto-adjust the allowed reassignment concurrency for ongoing executions based on a version of
+   * additive-increase/multiplicative-decrease (AIMD) feedback control algorithm. The adjustment decisions are made using:
+   * <ul>
+   *   <li>(At/Under)MinISR status of partitions (i.e. every time this runnable is called), and</li>
+   *   <li>Selected metrics (i.e. only once for every {@link #_numMinIsrCheck} checks of this runnable and only when MinISR-based check
+   *   does not generate a recommendation)</li>
+   * </ul>
    */
   private class ConcurrencyAdjuster implements Runnable {
+    private final int _numMinIsrCheck;
     private LoadMonitor _loadMonitor;
+    private int _numChecks;
 
-    ConcurrencyAdjuster() {
+    ConcurrencyAdjuster(int numMinIsrCheck) {
+      _numMinIsrCheck = numMinIsrCheck;
       _loadMonitor = null;
+      _numChecks = 0;
     }
 
     /**
@@ -334,7 +360,7 @@ public class Executor {
     }
 
     private boolean canRefreshConcurrency(ConcurrencyType concurrencyType) {
-      if (!_concurrencyAdjusterEnabled.get(concurrencyType) || _loadMonitor == null) {
+      if (!_concurrencyAdjusterEnabled.get(concurrencyType) || _loadMonitor == null || _stopSignal.get() != NO_STOP_EXECUTION) {
         return false;
       }
       switch (concurrencyType) {
@@ -348,33 +374,60 @@ public class Executor {
       }
     }
 
-    private synchronized void refreshInterBrokerReplicaConcurrency() {
-      if (canRefreshConcurrency(ConcurrencyType.INTER_BROKER_REPLICA)) {
-        Integer recommendedConcurrency = ExecutionUtils.recommendedConcurrency(_loadMonitor.currentBrokerMetricValues(),
-                                                                               _executionTaskManager.interBrokerPartitionMovementConcurrency(),
-                                                                               ConcurrencyType.INTER_BROKER_REPLICA);
+    private synchronized void refreshConcurrency(boolean canRunMetricsBasedCheck, ConcurrencyType concurrencyType) {
+      if (canRefreshConcurrency(concurrencyType)) {
+        Integer recommendedConcurrency = minIsrBasedConcurrency(_executionTaskManager.interBrokerPartitionMovementConcurrency(), concurrencyType);
+        if (recommendedConcurrency == null && canRunMetricsBasedCheck) {
+          recommendedConcurrency = ExecutionUtils.recommendedConcurrency(_loadMonitor.currentBrokerMetricValues(),
+                                                                         _executionTaskManager.movementConcurrency(concurrencyType),
+                                                                         concurrencyType);
+        }
+
         if (recommendedConcurrency != null) {
-          setRequestedInterBrokerPartitionMovementConcurrency(recommendedConcurrency);
+          if (recommendedConcurrency != ExecutionUtils.CANCEL_THE_EXECUTION) {
+            setRequestedMovementConcurrency(recommendedConcurrency, concurrencyType);
+          } else {
+            LOG.info("Stop the ongoing execution as per recommendation of Concurrency Adjuster.");
+            stopExecution(false);
+          }
         }
       }
     }
 
-    private synchronized void refreshLeadershipConcurrency() {
-      if (canRefreshConcurrency(ConcurrencyType.LEADERSHIP)) {
-        Integer recommendedConcurrency = ExecutionUtils.recommendedConcurrency(_loadMonitor.currentBrokerMetricValues(),
-                                                                               _executionTaskManager.leadershipMovementConcurrency(),
-                                                                               ConcurrencyType.LEADERSHIP);
-        if (recommendedConcurrency != null) {
-          setRequestedLeadershipMovementConcurrency(recommendedConcurrency);
-        }
+    private void maybeRetrieveAndCacheTopicMinIsr(Set<String> topicsToCheck) {
+      topicsToCheck.removeAll(_topicMinIsrCache.minIsrWithTimeByTopic().keySet());
+      if (topicsToCheck.isEmpty()) {
+        return;
       }
+
+      Set<ConfigResource> topicResourcesToCheck = new HashSet<>(topicsToCheck.size());
+      topicsToCheck.forEach(t -> topicResourcesToCheck.add(new ConfigResource(ConfigResource.Type.TOPIC, t)));
+      DescribeConfigsResult describeConfigsResult = _adminClient.describeConfigs(topicResourcesToCheck);
+      _topicMinIsrCache.putTopicMinIsr(describeConfigsResult);
+    }
+
+    /**
+     * @param currentMovementConcurrency The effective allowed movement concurrency.
+     * @param concurrencyType The type of concurrency for which the recommendation is requested.
+     * @return {@code null} to indicate recommendation for no change in allowed movement concurrency, {@code 0} to indicate recommendation to
+     * cancel the execution, or a positive integer to indicate the recommended movement concurrency.
+     */
+    private Integer minIsrBasedConcurrency(int currentMovementConcurrency, ConcurrencyType concurrencyType) {
+      if (!_concurrencyAdjusterMinIsrCheckEnabled) {
+        return null;
+      }
+      Cluster cluster = _loadMonitor.kafkaCluster();
+      maybeRetrieveAndCacheTopicMinIsr(new HashSet<>(cluster.topics()));
+
+      return ExecutionUtils.recommendedConcurrency(cluster, _topicMinIsrCache.minIsrWithTimeByTopic(), currentMovementConcurrency, concurrencyType);
     }
 
     @Override
     public void run() {
       try {
-        refreshInterBrokerReplicaConcurrency();
-        refreshLeadershipConcurrency();
+        boolean canRunMetricsBasedCheck = (_numChecks++ % _numMinIsrCheck) == 0;
+        refreshConcurrency(canRunMetricsBasedCheck, ConcurrencyType.INTER_BROKER_REPLICA);
+        refreshConcurrency(canRunMetricsBasedCheck, ConcurrencyType.LEADERSHIP);
       } catch (Throwable t) {
         LOG.warn("Received exception when trying to adjust reassignment concurrency.", t);
       }
@@ -470,6 +523,18 @@ public class Executor {
       throw new IllegalArgumentException(String.format("Concurrency adjuster for %s is not yet supported.", concurrencyType));
     }
     return _concurrencyAdjusterEnabled.put(concurrencyType, isConcurrencyAdjusterEnabled);
+  }
+
+  /**
+   * Enable or disable (At/Under)MinISR-based concurrency adjustment.
+   *
+   * @param isMinIsrBasedConcurrencyAdjustmentEnabled {@code true} to enable (At/Under)MinISR-based concurrency adjustment, {@code false} otherwise.
+   * @return {@code true} if (At/Under)MinISR-based concurrency adjustment was enabled before, {@code false} otherwise.
+   */
+  public boolean setConcurrencyAdjusterMinIsrCheck(boolean isMinIsrBasedConcurrencyAdjustmentEnabled) {
+    boolean oldValue = _concurrencyAdjusterMinIsrCheckEnabled;
+    _concurrencyAdjusterMinIsrCheckEnabled = isMinIsrBasedConcurrencyAdjustmentEnabled;
+    return oldValue;
   }
 
   /**
@@ -629,6 +694,28 @@ public class Executor {
   }
 
   /**
+   * Dynamically set the movement concurrency of the given type.
+   *
+   * @param requestedMovementConcurrency The maximum number of concurrent movements.
+   * @param concurrencyType The type of concurrency for which the requested movement concurrency will be set.
+   */
+  public void setRequestedMovementConcurrency(Integer requestedMovementConcurrency, ConcurrencyType concurrencyType) {
+    switch (concurrencyType) {
+      case INTER_BROKER_REPLICA:
+        setRequestedInterBrokerPartitionMovementConcurrency(requestedMovementConcurrency);
+        break;
+      case INTRA_BROKER_REPLICA:
+        setRequestedIntraBrokerPartitionMovementConcurrency(requestedMovementConcurrency);
+        break;
+      case LEADERSHIP:
+        setRequestedLeadershipMovementConcurrency(requestedMovementConcurrency);
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported concurrency type " + concurrencyType + " is provided.");
+    }
+  }
+
+  /**
    * Set the execution mode of the tasks to keep track of the ongoing execution mode via sensors.
    *
    * @param isKafkaAssignerMode True if kafka assigner mode, false otherwise.
@@ -679,10 +766,31 @@ public class Executor {
                               boolean isTriggeredByUserRequest) throws OngoingExecutionException {
     _executionStoppedByUser.set(false);
     sanityCheckOngoingMovement();
-    _hasOngoingExecution = true;
+
+    try {
+      _flipOngoingExecutionMutex.acquire();
+      try {
+        _hasOngoingExecution = true;
+        _stopSignal.set(NO_STOP_EXECUTION);
+        try {
+          // Wait if Executor is shutting down.
+          _noOngoingExecutionSemaphore.acquire();
+          // Block Executor from shutting down until ongoing execution stopped.
+        } catch (final InterruptedException ie) {
+          _hasOngoingExecution = false;
+          throw new IllegalStateException("Interrupted while shutting down executor.");
+        }
+      } finally {
+        _flipOngoingExecutionMutex.release();
+      }
+    } catch (final InterruptedException ie) {
+      // handle acquire failure for _flipOngoingExecutionMutex here
+      _hasOngoingExecution = false;
+      throw new IllegalStateException("Interrupted while shutting down executor.");
+    }
+
     _anomalyDetectorManager.maybeClearOngoingAnomalyDetectionTimeMs();
     _anomalyDetectorManager.resetHasUnfixableGoals();
-    _stopSignal.set(NO_STOP_EXECUTION);
     _executionStoppedByUser.set(false);
     if (_isKafkaAssignerMode) {
       _numExecutionStartedInKafkaAssignerMode.incrementAndGet();
@@ -816,9 +924,29 @@ public class Executor {
    */
   public synchronized void shutdown() {
     LOG.info("Shutting down executor.");
-    if (_hasOngoingExecution) {
-      LOG.warn("Shutdown executor may take long because execution is still in progress.");
+
+    try {
+      _flipOngoingExecutionMutex.acquire();
+      try {
+        if (_hasOngoingExecution) {
+          LOG.warn("Shutdown executor may take long because execution is still in progress.");
+          stopExecution(false);
+        }
+        try {
+          LOG.info("Waiting for ongoing execution to stop completely if any.");
+          _noOngoingExecutionSemaphore.acquire();
+          LOG.info("Blocking new execution from proceeding.");
+        } catch (final InterruptedException ie) {
+          LOG.warn("Interrupted while waiting for ongoing execution to stop.");
+        }
+      } finally {
+        _flipOngoingExecutionMutex.release();
+      }
+    } catch (final InterruptedException ie) {
+      // handle acquire failure for _flipOngoingExecutionMutex
+      LOG.warn("Interrupted while checking if there is ongoing execution to stop.");
     }
+
     _proposalExecutor.shutdown();
 
     try {
@@ -831,6 +959,7 @@ public class Executor {
     KafkaCruiseControlUtils.closeAdminClientWithTimeout(_adminClient);
     _executionHistoryScannerExecutor.shutdownNow();
     _concurrencyAdjusterExecutor.shutdownNow();
+    _topicMinIsrCache.shutdown();
     LOG.info("Executor shutdown completed.");
   }
 
@@ -916,6 +1045,7 @@ public class Executor {
       if (isTriggeredByUserRequest && _userTaskManager == null) {
         processExecuteProposalsFailure();
         _hasOngoingExecution = false;
+        _noOngoingExecutionSemaphore.release();
         _stopSignal.set(NO_STOP_EXECUTION);
         _executionStoppedByUser.set(false);
         LOG.error("Failed to initialize proposal execution.");
@@ -1115,6 +1245,7 @@ public class Executor {
       _reasonSupplier = null;
       _executorState = ExecutorState.noTaskInProgress(_recentlyDemotedBrokers, _recentlyRemovedBrokers);
       _hasOngoingExecution = false;
+      _noOngoingExecutionSemaphore.release();
       _stopSignal.set(NO_STOP_EXECUTION);
       _executionStoppedByUser.set(false);
       // Ensure that sampling mode is adjusted properly to continue collecting partition metrics after execution.

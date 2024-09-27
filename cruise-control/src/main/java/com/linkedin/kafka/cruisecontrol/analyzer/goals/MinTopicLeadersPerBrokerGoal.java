@@ -9,6 +9,8 @@ import com.linkedin.kafka.cruisecontrol.analyzer.ActionType;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingAction;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
 import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
+import com.linkedin.kafka.cruisecontrol.analyzer.ProvisionRecommendation;
+import com.linkedin.kafka.cruisecontrol.analyzer.ProvisionStatus;
 import com.linkedin.kafka.cruisecontrol.common.Utils;
 import com.linkedin.kafka.cruisecontrol.config.constants.AnalyzerConfig;
 import com.linkedin.kafka.cruisecontrol.exception.OptimizationFailureException;
@@ -31,6 +33,7 @@ import java.util.TreeSet;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.REPLICA_REJECT;
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionType.LEADERSHIP_MOVEMENT;
@@ -201,11 +204,12 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
 
     for (Map.Entry<String, Integer> numLeadersPerTopic : numLeadersByTopicNames.entrySet()) {
       if (numLeadersPerTopic.getValue() < totalMinimumLeaderCount) {
+        ProvisionRecommendation recommendation = new ProvisionRecommendation.Builder(ProvisionStatus.UNDER_PROVISIONED)
+            .numPartitions(totalMinimumLeaderCount).topic(numLeadersPerTopic.getKey()).build();
         throw new OptimizationFailureException(
             String.format("[%s] Cannot distribute %d leaders over %d broker(s) with minimum required per broker leader count %d for topic %s.",
                           name(), numLeadersPerTopic.getValue(), eligibleBrokersForLeadership.size(), minTopicLeadersPerBroker(),
-                          numLeadersPerTopic.getKey()),
-            String.format("Increase the partition count of topic %s to at least %d.", numLeadersPerTopic.getKey(), totalMinimumLeaderCount));
+                          numLeadersPerTopic.getKey()), recommendation);
       }
     }
   }
@@ -215,8 +219,9 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
     Set<Integer> brokersAllowedReplicaMove = GoalUtils.aliveBrokersNotExcludedForReplicaMove(clusterModel, optimizationOptions);
     if (brokersAllowedReplicaMove.isEmpty()) {
       // Handle the case when all alive brokers are excluded from replica moves.
-      throw new OptimizationFailureException(String.format("[%s] All alive brokers are excluded from replica moves.", name()),
-                                             String.format("Add at least %d brokers.", clusterModel.maxReplicationFactor()));
+      ProvisionRecommendation recommendation = new ProvisionRecommendation.Builder(ProvisionStatus.UNDER_PROVISIONED)
+          .numBrokers(clusterModel.maxReplicationFactor()).build();
+      throw new OptimizationFailureException(String.format("[%s] All alive brokers are excluded from replica moves.", name()), recommendation);
     }
   }
 
@@ -427,9 +432,10 @@ public class MinTopicLeadersPerBrokerGoal extends AbstractGoal {
     for (Replica offlineReplica : offlineReplicas) {
       if (maybeApplyBalancingAction(clusterModel, offlineReplica, eligibleBrokersToMoveOfflineReplicasTo,
                                     INTER_BROKER_REPLICA_MOVEMENT, optimizedGoals, optimizationOptions) == null) {
+        ProvisionRecommendation recommendation = new ProvisionRecommendation.Builder(ProvisionStatus.UNDER_PROVISIONED).numBrokers(1).build();
         throw new OptimizationFailureException(String.format("[%s] Cannot remove %s from %s broker %d (has %d replicas).", name(),
                                                              offlineReplica, srcBroker.state(), srcBroker.id(), srcBroker.replicas().size()),
-                                               "Add at least one broker.");
+                                               recommendation);
       }
     }
   }
